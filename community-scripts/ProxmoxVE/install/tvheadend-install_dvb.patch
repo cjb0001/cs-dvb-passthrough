@@ -1,0 +1,29 @@
+--- a/install/tvheadend-install.sh
++++ b/install/tvheadend-install.sh
+@@ -26,11 +26,24 @@
+ msg_info "Installing Tvheadend"
+ echo "tvheadend tvheadend/admin_username string ${var_admin_user}" | debconf-set-selections
+ echo "tvheadend tvheadend/admin_password password ${var_admin_pass}" | debconf-set-selections
+-$STD apt install -y tvheadend
++$STD apt install -y tvheadend || exit 1
+ msg_ok "Installed Tvheadend"
+ 
++# Configure only devices selected by the host DVB backend.
++if [[ ${ENABLE_DVB:-${var_dvb:-no}} == yes || -d /dev/dvb ]]; then
++  msg_info "Configuring Selected DVB Devices for TVHeadend"
++  dvb_require_nodes || exit 1
++  dvb_user=$(dvb_tvheadend_user) || exit 1
++  dvb_prepare_container "$dvb_user" || exit 1
++  if [[ ${dvb_groups_changed:-0} == 1 ]] && systemctl is-active --quiet tvheadend; then
++    systemctl restart tvheadend || exit 1
++  fi
++  msg_ok "Configured Selected DVB Devices for TVHeadend"
++fi
++
+ msg_info "Starting Service"
+-systemctl enable -q --now tvheadend
++systemctl enable -q --now tvheadend || exit 1
++if [[ -d /dev/dvb ]]; then dvb_verify_service "$dvb_user" tvheadend.service || exit 1; fi
+ msg_ok "Started Service"
+ 
+ msg_info "Saving Credentials"

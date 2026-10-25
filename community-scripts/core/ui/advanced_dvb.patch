@@ -1,0 +1,208 @@
+--- a/ui/advanced.func
++++ b/ui/advanced.func
+@@ -37,7 +37,7 @@
+     TAGS="community-script${var_tags:+;${var_tags}}"
+   fi
+   local STEP=1
+-  local MAX_STEP=31
++  local MAX_STEP=32
+ 
+   # Store values for back navigation - inherit from var_* app defaults
+   local _ct_type="${var_unprivileged:-1}"
+@@ -69,6 +69,8 @@
+   local _enable_fuse="${var_fuse:-no}"
+   local _enable_tun="${var_tun:-no}"
+   local _enable_gpu="${var_gpu:-no}"
++  local _enable_dvb="${var_dvb:-no}"
++  local _dvb_tuners="${dvb_tuners:-${var_dvb_tuners:-}}"
+   local _enable_nesting="${var_nesting:-1}"
+   local _verbose="${var_verbose:-no}"
+   local _enable_keyctl="${var_keyctl:-0}"
+@@ -810,10 +812,34 @@
+       ((STEP++))
+       ;;
+ 
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 22: Keyctl Support (Docker/systemd)
+-    # ═══════════════════════════════════════════════════════════════════════════
++    # STEP 22: DVB TV Tuner Passthrough (opt-in)
+     22)
++      local dvb_default_flag="--defaultno"
++      [[ "$_enable_dvb" == yes ]] && dvb_default_flag=""
++      if whiptail --backtitle "Proxmox VE Helper Scripts [Step $STEP/$MAX_STEP]" \
++        --title "DVB / TV TUNER PASSTHROUGH" --ok-button "Next" --cancel-button "Back" \
++        $dvb_default_flag --yesno "Connect DVB tuners to this container?\n\nChoose physical devices for Plex, TVHeadend or another media server.\nAll adapters of each selected device are included." 14 74; then
++        _enable_dvb=yes
++        if ! declare -F dvb_community_select >/dev/null; then
++          _cs_source_func "lib/dvb-selection.func" || return 1
++        fi
++        dvb_tuners="$_dvb_tuners"
++        if dvb_selection_ui=whiptail dvb_community_select --prompt; then
++          _dvb_tuners="$dvb_tuners"
++        else
++          continue
++        fi
++      else
++        if [[ $? == 1 ]]; then _enable_dvb=no
++        else ((STEP--)); continue; fi
++      fi
++      ((STEP++))
++      ;;
++
++    # ═══════════════════════════════════════════════════════════════════════════
++    # STEP 23: Keyctl Support (Docker/systemd)
++    # ═══════════════════════════════════════════════════════════════════════════
++    23)
+       if [[ "$_ct_type" == "1" ]]; then
+         _enable_keyctl="1"
+         ((STEP++))
+@@ -841,9 +867,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 23: APT Cacher Proxy
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    23)
++    # STEP 24: APT Cacher Proxy
++    # ═══════════════════════════════════════════════════════════════════════════
++    24)
+       local apt_cacher_default_flag="--defaultno"
+       [[ "$_apt_cacher" == "yes" ]] && apt_cacher_default_flag=""
+ 
+@@ -873,9 +899,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 24: HTTP/HTTPS Proxy
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    24)
++    # STEP 25: HTTP/HTTPS Proxy
++    # ═══════════════════════════════════════════════════════════════════════════
++    25)
+       local http_proxy_default_flag="--defaultno"
+       [[ -n "$_http_proxy" ]] && http_proxy_default_flag=""
+ 
+@@ -910,9 +936,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 25: Host CA Inheritance
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    25)
++    # STEP 26: Host CA Inheritance
++    # ═══════════════════════════════════════════════════════════════════════════
++    26)
+       local host_ca_count=0
+       local host_ca_dir="/usr/local/share/ca-certificates"
+       local cert
+@@ -948,9 +974,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 26: Container Timezone
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    26)
++    # STEP 27: Container Timezone
++    # ═══════════════════════════════════════════════════════════════════════════
++    27)
+       local tz_hint="$_ct_timezone"
+       [[ -z "$tz_hint" ]] && tz_hint="(empty - will use host timezone)"
+ 
+@@ -973,9 +999,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 27: Container Protection
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    27)
++    # STEP 28: Container Protection
++    # ═══════════════════════════════════════════════════════════════════════════
++    28)
+       local protect_default_flag="--defaultno"
+       [[ "$_protect_ct" == "yes" || "$_protect_ct" == "1" ]] && protect_default_flag=""
+ 
+@@ -997,9 +1023,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 28: Device Node Creation (mknod)
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    28)
++    # STEP 29: Device Node Creation (mknod)
++    # ═══════════════════════════════════════════════════════════════════════════
++    29)
+       local mknod_default_flag="--defaultno"
+       [[ "$_enable_mknod" == "1" ]] && mknod_default_flag=""
+ 
+@@ -1021,9 +1047,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 29: Mount Filesystems
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    29)
++    # STEP 30: Mount Filesystems
++    # ═══════════════════════════════════════════════════════════════════════════
++    30)
+       local mount_hint=""
+       [[ -n "$_mount_fs" ]] && mount_hint="$_mount_fs" || mount_hint="(none)"
+ 
+@@ -1047,9 +1073,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 30: Optional host-side post-install hook (path on the Proxmox HOST)
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    30)
++    # STEP 31: Optional host-side post-install hook (path on the Proxmox HOST)
++    # ═══════════════════════════════════════════════════════════════════════════
++    31)
+       local _hook_prompt="Optional: absolute path to a *.sh file ON THE PROXMOX HOST.
+ 
+ It runs as root on the HOST (NOT in the LXC) after the container
+@@ -1097,9 +1123,9 @@
+       ;;
+ 
+     # ═══════════════════════════════════════════════════════════════════════════
+-    # STEP 31: Verbose Mode & Confirmation
+-    # ═══════════════════════════════════════════════════════════════════════════
+-    31)
++    # STEP 32: Verbose Mode & Confirmation
++    # ═══════════════════════════════════════════════════════════════════════════
++    32)
+       local verbose_default_flag="--defaultno"
+       [[ "$_verbose" == "yes" ]] && verbose_default_flag=""
+ 
+@@ -1154,7 +1180,7 @@
+   FUSE: $_enable_fuse | TUN: $_enable_tun
+   Nesting: $nesting_desc | Keyctl: $keyctl_desc
+   Mknod: $([ "$_enable_mknod" == "1" ] && echo Enabled || echo Disabled) | Mount FS: ${_mount_fs:-(none)}
+-  GPU: $_enable_gpu | Protection: $protect_desc
++  GPU: $_enable_gpu | DVB: $_enable_dvb ($_dvb_tuners) | Protection: $protect_desc
+ 
+ Advanced:
+   Timezone: $tz_display
+@@ -1197,6 +1223,7 @@
+   ENABLE_FUSE="$_enable_fuse"
+   ENABLE_TUN="$_enable_tun"
+   ENABLE_GPU="$_enable_gpu"
++  export ENABLE_DVB="$_enable_dvb" dvb_tuners="$_dvb_tuners"
+   ENABLE_NESTING="$_enable_nesting"
+   ENABLE_KEYCTL="$_enable_keyctl"
+   ENABLE_MKNOD="$_enable_mknod"
+@@ -1213,6 +1240,7 @@
+ 
+   # Update var_* based on user choice (for functions that check these)
+   var_gpu="$_enable_gpu"
++  export var_dvb="$_enable_dvb" var_dvb_tuners="$_dvb_tuners"
+   var_sdn_vnet="$_sdn_vnet"
+   var_fuse="$_enable_fuse"
+   var_tun="$_enable_tun"
+@@ -1305,6 +1333,7 @@
+   log_msg "Mknod: $([ "${ENABLE_MKNOD:-0}" == "1" ] && echo "Enabled" || echo "Disabled")"
+   [[ -n "${ALLOW_MOUNT_FS:-}" ]] && log_msg "Mount FS: ${ALLOW_MOUNT_FS}"
+   log_msg "GPU Passthrough: ${ENABLE_GPU:-no}"
++  log_msg "DVB Passthrough: ${ENABLE_DVB:-no} (${dvb_tuners:-})"
+   [[ -n "${HTTP_PROXY:-}" ]] && log_msg "HTTP Proxy: ${HTTP_PROXY}"
+   [[ "${INHERIT_HOST_CA:-no}" == "yes" ]] && log_msg "Host CA Inheritance: Enabled"
+   [[ -n "${var_post_install:-}" ]] && log_msg "Post-Install Hook: ${var_post_install}"

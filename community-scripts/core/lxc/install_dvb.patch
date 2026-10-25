@@ -1,0 +1,10 @@
+--- a/lxc/install.func
++++ b/lxc/install.func
+@@ -82,6 +82,7 @@
+ # help here — a container has its own filesystem — so fetch them concurrently
+ # on this side too. verify-split-files.yml checks the list is complete.
+ _CS_CT_ENGINE_FILES=(
++  lib/dvb-selection.func lib/dvb.func lib/dvb-banner.func
+   core/core.func core/error_handler.func
+   lib/tools.func lib/alpine.func lib/db.func lib/forge.func
+   lib/hwaccel.func lib/runtime.func lib/system.func

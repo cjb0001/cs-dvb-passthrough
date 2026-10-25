@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG / Chris
+# License: MIT
+# Shared with the embedded selection helpers in dvb-passthrough.sh.
+
+dvb_selection_error() { printf '[ERROR] %s\n' "$*" >&2; }
+
+# Data files only: never source host tracking files as shell code.
+dvb_assignment_records() {
+  local root=${dvb_state_root:-${STABLE_ROOT:-/var/lib/dvb-passthrough}} file directory id _slot vid pid serial _rest
+  local -a files=("$root"/proxmox/*/selection "$root"/incus/*/*/selection "$root"/*/selection)
+  files+=("$root"/proxmox/*/stable-map)
+  for file in "${files[@]}"; do
+    [[ -f $file ]] || continue
+    directory=${file%/*}
+    [[ $directory != "${STATE:-}" ]] || continue
+    if [[ $file == */stable-map ]]; then
+      [[ ! -f $directory/selection ]] || continue
+      while read -r _slot vid pid serial _rest; do
+        [[ $vid =~ ^[a-f0-9]{4}$ && $pid =~ ^[a-f0-9]{4}$ && $serial =~ ^[a-zA-Z0-9_.:-]+$ ]] || {
+          dvb_selection_error "Invalid assignment map: $file"
+          return 1
+        }
+        printf '%s\tusb:%s:%s:%s\n' "$directory" "$vid" "$pid" "$serial"
+      done <"$file"
+    else
+      while IFS= read -r id || [[ -n $id ]]; do
+        [[ $id == usb:* || $id == path:* ]] || {
+          dvb_selection_error "Invalid assignment selection: $file"
+          return 1
+        }
+        printf '%s\t%s\n' "$directory" "$id"
+      done <"$file"
+    fi
+  done
+}
+
+dvb_assignment_matches() {
+  local id=$1 index=$2
+  [[ $id == "${dvb_tuner_keys[$index]}" || -n ${dvb_tuner_ids[$index]} && $id == "${dvb_tuner_ids[$index]}" ]]
+}
+
+dvb_check_source() {
+  local source=$1 owner=$2 node resolved number major minor
+  if [[ $source == @* ]]; then
+    [[ $source =~ ^@([0-9]+):([0-9]+)$ ]] || {
+      dvb_selection_error "Review numeric character-device mapping in $owner"
+      return 1
+    }
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    for node in "${dvb_selected_nodes[@]}"; do
+      [[ -c $node ]] || continue
+      number=$(stat -Lc '%t:%T' -- "$node") || return
+      printf -v number '%d:%d' "0x${number%:*}" "0x${number#*:}"
+      if [[ $number == "$major:$minor" ]]; then
+        dvb_selection_error "$owner already exposes selected device $node as $source"
+        return 1
+      fi
+    done
+    return 0
+  fi
+  [[ $source != '?unix-char' ]] || {
+    dvb_selection_error "Review source-less character-device mapping in $owner"
+    return 1
+  }
+  [[ $source == /* ]] || return 0
+  [[ $source != *\\* && $source != *'*'* && $source != *'?'* && $source != *'['* ]] || {
+    dvb_selection_error "Review escaped or wildcard device source in $owner: $source"
+    return 1
+  }
+  if [[ $source == /dev/dvb/* || $source == /dev/media[0-9]* ]]; then
+    [[ -e $source ]] || {
+      dvb_selection_error "Cannot resolve old DVB device mapping in $owner: $source; review its ownership first"
+      return 1
+    }
+  fi
+  resolved=$(readlink -m -- "$source") || return
+  for node in "${dvb_selected_nodes[@]}"; do
+    # Directory mounts expose descendants, including not-yet-created adapters.
+    if [[ $node == "$source" || $node == "$source/"* || $node == "$resolved" || $node == "$resolved/"* ]]; then
+      dvb_selection_error "$owner already exposes selected device $node via $source; release it and stop/start the source container first"
+      return 1
+    fi
+    if [[ -c $source && -c $node ]]; then
+      number=$(stat -Lc '%t:%T' -- "$source") || return
+      if [[ $number == "$(stat -Lc '%t:%T' -- "$node")" ]]; then
+        dvb_selection_error "$owner already exposes selected device $node via $source; release it and stop/start the source container first"
+        return 1
+      fi
+    fi
+  done
+}
+
+dvb_check_runtime() {
+  local numbers=$1 owner=$2 number node
+  while IFS= read -r number; do
+    [[ $number =~ ^[a-fA-F0-9]+:[a-fA-F0-9]+$ ]] || {
+      dvb_selection_error "Invalid runtime device inventory from $owner"
+      return 1
+    }
+    for node in "${dvb_selected_nodes[@]}"; do
+      if [[ -c $node && $(stat -Lc '%t:%T' -- "$node") == "$number" ]]; then
+        dvb_selection_error "$owner still has a live node for $node; stop/start the source container before reassignment"
+        return 1
+      fi
+    done
+  done <<<"$numbers"
+}
+
+# The emitted script only stats nodes; it never opens/tunes a frontend.
+dvb_runtime_inventory() {
+  printf '%s\n' 'for node in /dev/dvb/adapter*/* /dev/media*; do [ ! -c "$node" ] || stat -Lc "%t:%T" "$node" || exit; done; exit 0'
+}
+
+dvb_check_pve_file() {
+  local file=$1 owner=$2 line value source option
+  local -a options=()
+  while IFS= read -r line; do
+    [[ $line != \[* ]] || break
+    if [[ $line =~ ^dev[0-9]+:[[:space:]]*(.*) ]]; then
+      value=${BASH_REMATCH[1]}
+      IFS=',' read -r -a options <<<"$value"
+      for option in "${options[@]}"; do
+        option=${option#"${option%%[![:space:]]*}"}
+        source=${option#path=}
+        dvb_check_source "$source" "$owner" || return
+      done
+    elif [[ $line == lxc.mount.entry:* ]]; then
+      read -r source value <<<"${line#*:}"
+      dvb_check_source "$source" "$owner" || return
+    fi
+  done <"$file"
+}
+
+dvb_check_pve_assignments() {
+  local target=$1 directory=${dvb_pve_config_dir:-/etc/pve/lxc} file ct status numbers
+  for file in "$directory"/*.conf; do
+    [[ -f $file ]] || continue
+    ct=${file##*/}
+    ct=${ct%.conf}
+    [[ $ct != "$target" ]] || continue
+    dvb_check_pve_file "$file" "Proxmox CT $ct" || return
+    status=$(pct status "$ct") || return
+    if [[ $status == 'status: running' ]]; then
+      numbers=$(pct exec "$ct" -- sh -c "$(dvb_runtime_inventory)") || {
+        dvb_selection_error "Cannot inspect live device ownership in CT $ct"
+        return 1
+      }
+      [[ -z $numbers ]] || dvb_check_runtime "$numbers" "Proxmox CT $ct" || return
+    fi
+  done
+}
+
+# Bypass the standalone wrapper's pinned project, but always use the local daemon.
+dvb_incus_query() { command incus --force-local "$@"; }
+
+# shellcheck disable=SC2120 # Standalone target validation supplies excluded managed keys.
+dvb_incus_device_sources() {
+  awk -v excluded="${1:-}" '
+    function scalar(line) {sub(/^    [^:]+: */, "", line); gsub(/^["\047]|["\047]$/, "", line); return line}
+    function emit() {
+      if (!skipped && source != "" && source != "null") print source
+      else if (!skipped && type == "unix-char") {
+        if (major ~ /^[0-9]+$/ && minor ~ /^[0-9]+$/) print "@" major ":" minor
+        else print "?unix-char"
+      }
+      source=type=major=minor=""
+      skipped=0
+    }
+    /^devices:$/ {in_devices=1; next}
+    in_devices && /^[^ ]/ {emit(); in_devices=0}
+    in_devices && /^  [^ ]/ {emit(); name=$0; sub(/^  /, "", name); sub(/:$/, "", name); skipped=index(" " excluded " ", " " name " ") > 0}
+    in_devices && /^    source:/ {source=scalar($0)}
+    in_devices && /^    type:/ {type=scalar($0)}
+    in_devices && /^    major:/ {major=scalar($0)}
+    in_devices && /^    minor:/ {minor=scalar($0)}
+    END {if (in_devices) emit()}'
+}
+
+dvb_check_incus_assignments() {
+  local target=$1 selected_project=${INCUS_PROJECT:-${INCUS_PROJECT_NAME:-default}} projects project instances ct type config sources source numbers status
+  projects=$(dvb_incus_query project list -c n --format csv) || return
+  while IFS= read -r project; do
+    [[ $project =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || return 1
+    instances=$(dvb_incus_query --project "$project" list -c nts --format csv) || return
+    while IFS=, read -r ct type status; do
+      [[ -n $ct && $type == CONTAINER* ]] || continue
+      [[ $project != "$selected_project" || $ct != "$target" ]] || continue
+      config=$(dvb_incus_query --project "$project" config show "$ct" --expanded) || return
+      # Incus emits absolute device source paths as YAML scalars. Reject quoted
+      # escape sequences rather than guessing their decoded meaning.
+      sources=$(dvb_incus_device_sources <<<"$config") || return
+      while IFS= read -r source; do
+        [[ -n $source ]] || continue
+        [[ $source != *\\* ]] || {
+          dvb_selection_error "Review escaped device source in Incus $project/$ct"
+          return 1
+        }
+        source=${source#\"}
+        source=${source%\"}
+        source=${source#\'}
+        source=${source%\'}
+        dvb_check_source "$source" "Incus $project/$ct" || return
+      done <<<"$sources"
+      if [[ $status == RUNNING ]]; then
+        numbers=$(dvb_incus_query --project "$project" exec "$ct" -- sh -c "$(dvb_runtime_inventory)") || return
+        [[ -z $numbers ]] || dvb_check_runtime "$numbers" "Incus $project/$ct" || return
+      fi
+    done <<<"$instances"
+  done <<<"$projects"
+}
+
+dvb_assignment_preflight() {
+  local platform=$1 target=$2 records owner id i
+  records=$(dvb_assignment_records) || return
+  while IFS=$'\t' read -r owner id; do
+    [[ -n $owner ]] || continue
+    for i in "${dvb_selected_indices[@]}"; do
+      if dvb_assignment_matches "$id" "$i"; then
+        dvb_selection_error "${dvb_tuner_labels[$i]} is assigned to $owner; release the source assignment first"
+        return 1
+      fi
+    done
+  done <<<"$records"
+  case "$platform" in
+  proxmox) dvb_check_pve_assignments "$target" ;;
+  incus) dvb_check_incus_assignments "$target" ;;
+  *)
+    dvb_selection_error "Unknown assignment platform: $platform"
+    return 1
+    ;;
+  esac
+}
+
+dvb_assignment_labels() {
+  local records owner id i root=${dvb_state_root:-${STABLE_ROOT:-/var/lib/dvb-passthrough}}
+  local -A labelled=()
+  records=$(dvb_assignment_records) || return
+  while IFS=$'\t' read -r owner id; do
+    [[ -n $owner ]] || continue
+    for i in "${!dvb_tuner_roots[@]}"; do
+      if dvb_assignment_matches "$id" "$i" && [[ -z ${labelled["$i:$owner"]+x} ]]; then
+        dvb_tuner_labels[$i]+=" [Assigned: ${owner#"$root"/}]"
+        labelled["$i:$owner"]=1
+      fi
+    done
+  done <<<"$records"
+}
+
+# Called under the same host lock as assignment changes. Build the union before
+# replacing the managed file, so a split deployment retains both power policies.
+# shellcheck disable=SC2120 # Standalone removal supplies false; creation defaults to true.
+dvb_power_update() {
+  local include_current=${1:-true} rules=${dvb_power_rules:-/etc/udev/rules.d/99-tvtuner-power.rules} records owner id i physical vid pid port temporary _prefix serial line matches backup backup_root
+  local -A selected=() wanted=() ruleset=()
+  [[ ! -e $rules ]] || grep -qE '^# (Generated: USB autosuspend|Automatically generated:.*[Tt]uner)' "$rules" || {
+    dvb_selection_error "Unrecognized power rule file: $rules"
+    return 1
+  }
+  if [[ $include_current == true ]]; then
+    for i in "${dvb_selected_indices[@]}"; do
+      selected[$i]=1
+      wanted[${dvb_tuner_ids[$i]:-${dvb_tuner_keys[$i]}}]=1
+    done
+  fi
+  # Keep the previous target selection too until its config has been committed.
+  records=$(STATE='' dvb_assignment_records) || return
+  while IFS=$'\t' read -r owner id; do
+    [[ -n $owner ]] || continue
+    wanted[$id]=1
+    for i in "${!dvb_tuner_roots[@]}"; do
+      if dvb_assignment_matches "$id" "$i"; then selected[$i]=1; fi
+    done
+  done <<<"$records"
+  temporary=$(mktemp "${rules}.XXXXXXXX") || return
+  printf '%s\n' '# Generated: USB autosuspend disabled only for detected DVB tuner USB devices' >"$temporary"
+  for id in "${!wanted[@]}"; do
+    if [[ $id == usb:* ]]; then
+      IFS=: read -r _prefix vid pid serial <<<"$id"
+      [[ $vid =~ ^[a-f0-9]{4}$ && $pid =~ ^[a-f0-9]{4}$ && $serial =~ ^[a-zA-Z0-9_.:-]+$ ]] || {
+        rm -f -- "$temporary"
+        return 1
+      }
+      matches=0
+      for i in "${!dvb_tuner_roots[@]}"; do
+        physical=${dvb_tuner_roots[$i]}
+        if [[ ${dvb_tuner_serials[$i]} == "$serial" && -f $physical/idVendor && -f $physical/idProduct &&
+          $(cat "$physical/idVendor") == "$vid" && $(cat "$physical/idProduct") == "$pid" ]]; then matches=$((matches + 1)); fi
+      done
+      if ((matches > 1)); then
+        rm -f -- "$temporary"
+        dvb_selection_error "Ambiguous saved USB power identity: $id"
+        return 1
+      fi
+      printf -v line 'ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="%s", ATTR{idProduct}=="%s", ATTR{serial}=="%s", ATTR{power/control}="on"' "$vid" "$pid" "$serial"
+      ruleset[$line]=1
+    elif [[ $id == path:* && -f $rules ]]; then
+      # Keep a previously verified port rule for a disconnected path-identified
+      # USB device. Only the exact rule format emitted by this utility is kept.
+      port=${id#path:}
+      port=${port##*/}
+      if [[ $port =~ ^[0-9.-]+$ ]]; then
+        while IFS= read -r line; do
+          if [[ $line == *"KERNEL==\"$port\""* && $line =~ ^ACTION==\"add\|change\",\ SUBSYSTEM==\"usb\",\ ENV\{DEVTYPE\}==\"usb_device\",\ KERNEL==\"[0-9.-]+\",\ ATTR\{idVendor\}==\"[a-fA-F0-9]{4}\",\ ATTR\{idProduct\}==\"[a-fA-F0-9]{4}\",\ ATTR\{power/control\}=\"on\"$ ]]; then ruleset[$line]=1; fi
+        done <"$rules"
+      fi
+    fi
+  done
+  for i in "${!selected[@]}"; do
+    physical=${dvb_tuner_roots[$i]}
+    [[ -f $physical/idVendor && -f $physical/idProduct ]] || continue
+    vid=$(cat "$physical/idVendor")
+    pid=$(cat "$physical/idProduct")
+    port=${physical##*/}
+    [[ $vid =~ ^[a-fA-F0-9]{4}$ && $pid =~ ^[a-fA-F0-9]{4}$ && $port =~ ^[0-9.-]+$ ]] || {
+      rm -f -- "$temporary"
+      return 1
+    }
+    if [[ -z ${dvb_tuner_ids[$i]} ]]; then
+      # A path selection follows physical topology rather than an unusable or
+      # duplicate serial. Replace its previous port rule with current IDs.
+      for line in "${!ruleset[@]}"; do [[ $line != *"KERNEL==\"$port\""* ]] || unset 'ruleset[$line]'; done
+      printf -v line 'ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="%s", ATTR{idVendor}=="%s", ATTR{idProduct}=="%s", ATTR{power/control}="on"' "$port" "$vid" "$pid"
+      ruleset[$line]=1
+    fi
+    if [[ -f $physical/power/control ]]; then
+      printf 'on\n' >"$physical/power/control" || {
+        rm -f -- "$temporary"
+        return 1
+      }
+      [[ $(cat "$physical/power/control") == on ]] || {
+        rm -f -- "$temporary"
+        dvb_selection_error "USB power policy verification failed for $physical"
+        return 1
+      }
+    fi
+  done
+  if ((${#ruleset[@]})); then printf '%s\n' "${!ruleset[@]}" | LC_ALL=C sort >>"$temporary"; fi
+  if [[ -f $rules ]] && ! cmp -s "$temporary" "$rules"; then
+    backup_root=${dvb_power_backup_root:-/var/backups/dvb-passthrough}
+    mkdir -p "$backup_root" || {
+      rm -f -- "$temporary"
+      return 1
+    }
+    backup=$(mktemp -d "$backup_root/power.XXXXXXXX") || {
+      rm -f -- "$temporary"
+      return 1
+    }
+    cp -p -- "$rules" "$backup/" || {
+      rm -f -- "$temporary"
+      return 1
+    }
+    printf 'DVB power rules backup: %s\n' "$backup"
+  fi
+  chmod 0644 "$temporary" && mv -f -- "$temporary" "$rules" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  udevadm control --reload-rules
+}
+
+dvb_discover_tuners() {
+  local sys=${SYS_ROOT:-/sys} dev=${DEV_ROOT:-/dev} cls name adapter component node physical index label serial vid pid i key
+  local -A indices=() seen_adapters=() serial_counts=()
+  dvb_tuner_roots=()
+  dvb_tuner_keys=()
+  dvb_tuner_ids=()
+  dvb_tuner_serials=()
+  dvb_tuner_labels=()
+  dvb_tuner_nodes=()
+  dvb_tuner_adapters=()
+  for cls in "$sys"/class/dvb/*; do
+    name=${cls##*/}
+    [[ $name =~ ^dvb([0-9]+)\.([a-zA-Z0-9_]+)$ ]] || continue
+    adapter=${BASH_REMATCH[1]}
+    component=${BASH_REMATCH[2]}
+    node="$dev/dvb/adapter$adapter/$component"
+    [[ -c $node && -e $cls/device ]] || continue
+    physical=$(readlink -f "$cls/device") || return
+    while [[ $physical != "$sys" && $physical != / ]]; do
+      [[ ! -f $physical/idVendor || ! -f $physical/idProduct ]] || break
+      if [[ -L $physical/subsystem && $(readlink -f "$physical/subsystem") == "$sys/bus/pci" ]]; then break; fi
+      physical=${physical%/*}
+    done
+    [[ $physical != "$sys" && $physical != / ]] || continue
+    if [[ -z ${indices[$physical]+x} ]]; then
+      index=${#dvb_tuner_roots[@]}
+      indices[$physical]=$index
+      dvb_tuner_roots+=("$physical")
+      dvb_tuner_keys+=("path:${physical#"$sys"/devices/}")
+      serial=''
+      key=''
+      if [[ -f $physical/idVendor && -f $physical/idProduct ]]; then
+        vid=$(cat "$physical/idVendor")
+        pid=$(cat "$physical/idProduct")
+        label="USB $vid:$pid (${physical##*/})"
+        [[ ! -f $physical/product ]] || label="$(cat "$physical/product") — $label"
+        if [[ -f $physical/serial ]]; then
+          serial=$(cat "$physical/serial")
+          if [[ $vid =~ ^[0-9a-f]{4}$ && $pid =~ ^[0-9a-f]{4}$ && $serial =~ ^[a-zA-Z0-9_.:-]+$ ]]; then
+            key="usb:$vid:$pid:$serial"
+            serial_counts[$key]=$((${serial_counts[$key]:-0} + 1))
+            label+=" — serial $serial"
+          else serial=''; fi
+        fi
+      else
+        label="PCI ${physical##*/}"
+        [[ ! -f $physical/vendor || ! -f $physical/device ]] || label+=" $(cat "$physical/vendor"):$(cat "$physical/device")"
+      fi
+      dvb_tuner_labels+=("$label")
+      dvb_tuner_ids+=("$key")
+      dvb_tuner_serials+=("$serial")
+      dvb_tuner_nodes+=('')
+      dvb_tuner_adapters+=('')
+    else index=${indices[$physical]}; fi
+    dvb_tuner_nodes[$index]+="$node "
+    if [[ -z ${seen_adapters["$physical:$adapter"]+x} ]]; then
+      seen_adapters["$physical:$adapter"]=1
+      dvb_tuner_adapters[$index]+="${dvb_tuner_adapters[$index]:+,}$adapter"
+    fi
+  done
+  # Related media nodes inherit the same physical-device selection.
+  for cls in "$sys"/class/media/*; do
+    node="$dev/${cls##*/}"
+    [[ -c $node && -e $cls/device ]] || continue
+    physical=$(readlink -f "$cls/device") || return
+    for i in "${!dvb_tuner_roots[@]}"; do
+      [[ $physical != "${dvb_tuner_roots[$i]}" && $physical != "${dvb_tuner_roots[$i]}/"* ]] || dvb_tuner_nodes[$i]+="$node "
+    done
+  done
+  # Duplicate serials remain selectable by physical path, never ambiguously.
+  for i in "${!dvb_tuner_ids[@]}"; do
+    key=${dvb_tuner_ids[$i]}
+    [[ -z $key || ${serial_counts[$key]} == 1 ]] || dvb_tuner_ids[$i]=''
+  done
+  dvb_assignment_labels
+}
+
+dvb_resolve_selection() {
+  local request i found
+  local -A seen=()
+  dvb_selected_indices=()
+  for request in "$@"; do
+    found=''
+    for i in "${!dvb_tuner_roots[@]}"; do
+      if [[ $request == "${dvb_tuner_keys[$i]}" ||
+        -n ${dvb_tuner_ids[$i]} && $request == "${dvb_tuner_ids[$i]}" ||
+        -n ${dvb_tuner_serials[$i]} && $request == "${dvb_tuner_serials[$i]}" ]]; then
+        [[ -z $found ]] || {
+          dvb_selection_error "Ambiguous tuner '$request'; use its path ID"
+          return 1
+        }
+        found=$i
+      fi
+    done
+    [[ -n $found ]] || {
+      dvb_selection_error "Selected tuner is unavailable: $request"
+      return 1
+    }
+    if [[ -z ${seen[$found]+x} ]]; then
+      dvb_selected_indices+=("$found")
+      seen[$found]=1
+    fi
+  done
+}
+
+dvb_select_tuners() {
+  local i n reply flag saved_request defaults_ok=true checklist=false
+  local -a requests=("$@") defaults=() choices=() menu=() labels=()
+  local -A saved=()
+  if [[ ${dvb_select_all:-false} == true ]]; then
+    dvb_selected_indices=("${!dvb_tuner_roots[@]}")
+  elif ((${#requests[@]})); then
+    dvb_resolve_selection "${requests[@]}" || return
+  else
+    if ((${#dvb_selection_defaults[@]})); then
+      # Resolve individually so an unplugged saved device does not make other
+      # saved devices appear new or lose their checked state.
+      for saved_request in "${dvb_selection_defaults[@]}"; do
+        if dvb_resolve_selection "$saved_request"; then
+          for i in "${dvb_selected_indices[@]}"; do saved[$i]=1; done
+        else defaults_ok=false; fi
+      done
+    fi
+    for i in "${!dvb_tuner_roots[@]}"; do
+      labels[$i]=${dvb_tuner_labels[$i]}
+      if [[ -n ${saved[$i]+x} ]]; then
+        defaults+=("$i")
+        labels[$i]+=' [Saved]'
+      elif ((${#dvb_selection_defaults[@]})); then
+        labels[$i]+=' [New]'
+      fi
+    done
+    if [[ -t 0 || ${dvb_selection_ui:-text} == whiptail ]]; then
+      if [[ ${dvb_selection_ui:-text} == whiptail ]] && command -v whiptail >/dev/null; then
+        checklist=true
+        for i in "${!dvb_tuner_roots[@]}"; do
+          flag=OFF
+          for n in "${defaults[@]}"; do [[ $n != "$i" ]] || flag=ON; done
+          menu+=("$((i + 1))" "${labels[$i]} (adapters ${dvb_tuner_adapters[$i]})" "$flag")
+        done
+        reply=$(whiptail --title 'Select physical DVB devices' --separate-output --checklist \
+          'Choose the device(s) to connect. All adapters in each selected device are included.' \
+          20 100 10 "${menu[@]}" 3>&1 1>&2 2>&3) || return 2
+      else
+        printf '\nSelect physical DVB devices (all adapters of each device are included):\n' >&2
+        for i in "${!dvb_tuner_roots[@]}"; do
+          printf '  %s) %s — adapters %s\n     %s\n' "$((i + 1))" "${labels[$i]}" "${dvb_tuner_adapters[$i]}" "${dvb_tuner_ids[$i]:-${dvb_tuner_keys[$i]}}" >&2
+        done
+        printf 'Enter numbers separated by spaces, all, or q to cancel' >&2
+        if ((${#defaults[@]})) && $defaults_ok; then printf ' (Enter keeps saved selection)' >&2; fi
+        printf ': ' >&2
+        read -r reply || return 2
+      fi
+      [[ $reply != q ]] || return 2
+      if [[ -z $reply && ${#defaults[@]} -gt 0 ]] && $defaults_ok && ! $checklist; then
+        dvb_selected_indices=("${defaults[@]}")
+      elif [[ $reply == all ]]; then
+        dvb_selected_indices=("${!dvb_tuner_roots[@]}")
+      else
+        reply=${reply//,/ }
+        # Whiptail separate-output uses newlines; read all choices, not one line.
+        reply=${reply//$'\n'/ }
+        read -r -a choices <<<"$reply"
+        requests=()
+        for n in "${choices[@]}"; do
+          [[ $n =~ ^[1-9][0-9]{0,5}$ ]] && ((10#$n <= ${#dvb_tuner_roots[@]})) || {
+            dvb_selection_error "Invalid tuner number: $n"
+            return 1
+          }
+          requests+=("${dvb_tuner_keys[$((10#$n - 1))]}")
+        done
+        dvb_resolve_selection "${requests[@]}" || return
+      fi
+    elif ((${#defaults[@]})) && $defaults_ok; then
+      dvb_selected_indices=("${defaults[@]}")
+    elif ((${#dvb_tuner_roots[@]} == 1)) && $defaults_ok; then
+      dvb_selected_indices=(0)
+    else
+      dvb_selection_error 'Choose tuners explicitly (--tuner ID / --all-tuners, or var_dvb_tuners for community scripts); no usable saved selection'
+      return 1
+    fi
+  fi
+  ((${#dvb_selected_indices[@]})) || {
+    dvb_selection_error 'Select at least one physical DVB device, or disable/remove DVB passthrough'
+    return 1
+  }
+  dvb_selected_ids=()
+  dvb_selected_nodes=()
+  dvb_selected_roots=()
+  for i in "${dvb_selected_indices[@]}"; do
+    dvb_selected_ids+=("${dvb_tuner_ids[$i]:-${dvb_tuner_keys[$i]}}")
+    dvb_selected_roots+=("${dvb_tuner_roots[$i]}")
+    read -r -a choices <<<"${dvb_tuner_nodes[$i]}"
+    dvb_selected_nodes+=("${choices[@]}")
+  done
+}
+
+# Community UI/backends call this after sourcing this library. A selection
+# supplied by advanced settings is reused without a second prompt.
+dvb_community_select() {
+  local value=${dvb_tuners:-${var_dvb_tuners:-}}
+  local -a requests=()
+  dvb_select_all=false
+  dvb_selection_defaults=()
+  dvb_discover_tuners || return
+  ((${#dvb_tuner_roots[@]})) || {
+    dvb_selection_error 'No initialized physical DVB devices found'
+    return 1
+  }
+  if [[ $value == all ]]; then
+    dvb_select_all=true
+  elif [[ -n $value ]]; then
+    value=${value//,/ }
+    read -r -a requests <<<"$value"
+  fi
+  if [[ ${1:-} == --prompt ]]; then
+    if $dvb_select_all; then
+      for value in "${!dvb_tuner_roots[@]}"; do dvb_selection_defaults+=("${dvb_tuner_keys[$value]}"); done
+    else dvb_selection_defaults=("${requests[@]}"); fi
+    dvb_select_all=false
+    requests=()
+  fi
+  dvb_select_tuners "${requests[@]}" || return
+  dvb_tuners=$(
+    IFS=,
+    printf '%s' "${dvb_selected_ids[*]}"
+  )
+  var_dvb_tuners=$dvb_tuners
+  export dvb_tuners var_dvb_tuners
+}
+
+dvb_community_pve_config() (
+  local configuration=$1 root=${dvb_state_root:-${STABLE_ROOT:-/var/lib/dvb-passthrough}} target
+  target=${CTID:-${configuration##*/}}
+  target=${target%.conf}
+  [[ $target =~ ^[1-9][0-9]*$ ]] || {
+    dvb_selection_error 'Invalid Proxmox CTID'
+    return 1
+  }
+  local STATE="$root/proxmox/$target"
+  exec 9>"${dvb_operation_lock:-/run/lock/dvb-passthrough.lock}" || return
+  flock -n 9 || {
+    dvb_selection_error 'Another DVB operation is running'
+    return 1
+  }
+  dvb_community_reselect || return
+  dvb_assignment_preflight proxmox "$target" || return
+  local dvb_community_state=$STATE
+  dvb_community_pve_write "$configuration" || return
+  dvb_power_update
+)
+
+dvb_community_reselect() {
+  local -a requested=("${dvb_selected_ids[@]}")
+  dvb_discover_tuners || return
+  dvb_select_all=false
+  dvb_select_tuners "${requested[@]}"
+}
+
+dvb_community_save_selection() {
+  local directory=$1 temporary profile_app profile_user
+  mkdir -p "$directory" && chmod 0700 "$directory" || return
+  temporary=$(mktemp "$directory/.selection.XXXXXXXX") || return
+  printf '%s\n' "${dvb_selected_ids[@]}" >"$temporary"
+  chmod 0600 "$temporary" && mv -f -- "$temporary" "$directory/selection" || return
+  case "${APP:-}" in
+  Plex | plex)
+    profile_app=plex
+    profile_user=${dvb_service_user:-plex}
+    ;;
+  Tvheadend | TVHeadend | tvheadend)
+    profile_app=tvheadend
+    profile_user=${dvb_service_user:-hts}
+    ;;
+  *) return 0 ;;
+  esac
+  [[ $profile_user =~ ^[a-zA-Z_][a-zA-Z0-9_-]*\$?$ ]] || return 1
+  temporary=$(mktemp "$directory/.profile.XXXXXXXX") || return
+  printf '%s\t%s\n' "$profile_app" "$profile_user" >"$temporary"
+  chmod 0600 "$temporary" && mv -f -- "$temporary" "$directory/profile"
+}
+
+dvb_community_save_devices() {
+  local directory=$1 filename=$2 temporary
+  shift 2
+  dvb_community_save_selection "$directory" || return
+  temporary=$(mktemp "$directory/.devices.XXXXXXXX") || return
+  printf '%s\n' "$@" >"$temporary"
+  chmod 0600 "$temporary" && mv -f -- "$temporary" "$directory/$filename"
+}
+
+dvb_community_pve_write() {
+  local configuration=$1 gid=${var_dvb_gid:-44} index=0 node clean
+  local -a entries=()
+  [[ $gid =~ ^(0|[1-9][0-9]{0,9})$ ]] && ((gid <= 2147483647)) || {
+    dvb_selection_error 'Invalid container DVB GID'
+    return 1
+  }
+  [[ -f $configuration ]] || return 1
+  clean=$(cat "$configuration") || return
+  dvb_check_pve_file "$configuration" 'existing target configuration' || return
+  if grep -qE '^dev[0-9]+:.*(/dev/dvb/|/dev/media[0-9]+)|^lxc.mount.entry:.* /?dev/dvb' <<<"$clean"; then
+    dvb_selection_error 'Existing DVB mappings require review before adding the selected devices'
+    return 1
+  fi
+  for node in "${dvb_selected_nodes[@]}"; do
+    [[ -c $node ]] || {
+      dvb_selection_error "Selected device disappeared: $node"
+      return 1
+    }
+    while grep -qE "^dev$index:" <<<"$clean"; do index=$((index + 1)); done
+    ((index < 256)) || return 1
+    entries+=("dev$index: path=$node,uid=0,gid=$gid,mode=0660")
+    index=$((index + 1))
+  done
+  ((${#entries[@]})) || return 1
+  if [[ -n ${dvb_community_state:-} ]]; then
+    dvb_community_save_devices "$dvb_community_state" devices.pending "${entries[@]}" || return
+  fi
+  printf '\n%s\n' "${entries[@]}" >>"$configuration" || return
+  if [[ -n ${dvb_community_state:-} ]]; then
+    mv -f -- "$dvb_community_state/devices.pending" "$dvb_community_state/devices" || return
+  fi
+}
+
+dvb_community_incus_config() (
+  [[ $EUID == 0 ]] || {
+    dvb_selection_error 'DVB host device management requires root; rerun as root or disable DVB'
+    return 1
+  }
+  local target=$1 root=${dvb_state_root:-${STABLE_ROOT:-/var/lib/dvb-passthrough}} project=${INCUS_PROJECT:-${INCUS_PROJECT_NAME:-default}}
+  [[ $project =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && $target =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || return 1
+  local STATE="$root/incus/$project/$target"
+  [[ $project != default ]] || STATE="$root/$target"
+  # Creation and the standalone utility serialize assignment changes together.
+  exec 9>"${dvb_operation_lock:-/run/lock/dvb-passthrough.lock}" || return
+  flock -n 9 || {
+    dvb_selection_error 'Another DVB operation is running'
+    return 1
+  }
+  dvb_community_reselect || return
+  dvb_assignment_preflight incus "$target" || return
+  local dvb_community_state=$STATE
+  dvb_community_incus_write "$target" || return
+  dvb_power_update
+)
+
+dvb_community_incus_write() {
+  local target=$1 gid=${var_dvb_gid:-44} node key expanded sources source
+  local -a keys=()
+  [[ $gid =~ ^(0|[1-9][0-9]{0,9})$ ]] && ((gid <= 2147483647)) || {
+    dvb_selection_error 'Invalid container DVB GID'
+    return 1
+  }
+  ((${#dvb_selected_nodes[@]})) || {
+    dvb_selection_error 'No selected DVB nodes'
+    return 1
+  }
+  # Complete the host-side validation before the first API mutation.
+  for node in "${dvb_selected_nodes[@]}"; do
+    [[ -c $node ]] || {
+      dvb_selection_error "Selected device disappeared: $node"
+      return 1
+    }
+    key="dvbpt_${node#/dev/}"
+    key=${key//\//_}
+    keys+=("$key")
+  done
+  if [[ -n ${dvb_community_state:-} ]]; then
+    expanded=$(incus config show "$target" --expanded) || return
+    sources=$(dvb_incus_device_sources <<<"$expanded") || return
+    while IFS= read -r source; do
+      [[ -z $source ]] || dvb_check_source "$source" 'existing Incus target configuration' || return
+    done <<<"$sources"
+    for key in "${keys[@]}"; do
+      if grep -qE "^  $key:" <<<"$expanded"; then
+        dvb_selection_error "Existing Incus device $key requires review"
+        return 1
+      fi
+    done
+    dvb_community_save_devices "$dvb_community_state" devices "${keys[@]}" || return
+  fi
+  for node in "${dvb_selected_nodes[@]}"; do
+    key="dvbpt_${node#/dev/}"
+    key=${key//\//_}
+    incus config device add "$target" "$key" unix-char "source=$node" "path=$node" \
+      uid=0 "gid=$gid" mode=0660 required=false || return
+  done
+}

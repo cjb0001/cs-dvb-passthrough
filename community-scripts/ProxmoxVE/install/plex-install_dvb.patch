@@ -1,0 +1,21 @@
+--- a/install/plex-install.sh
++++ b/install/plex-install.sh
+@@ -28,6 +28,18 @@
+ 
+ setup_hwaccel "plex"
+ 
++# Configure only devices selected by the host DVB backend.
++if [[ ${ENABLE_DVB:-${var_dvb:-no}} == yes || -d /dev/dvb ]]; then
++  msg_info "Configuring Selected DVB Devices for Plex"
++  dvb_require_nodes || exit 1
++  dvb_user=plex
++  dvb_prepare_container "$dvb_user" || exit 1
++  if [[ ${dvb_groups_changed:-0} == 1 ]] && systemctl is-active --quiet plexmediaserver; then
++    systemctl restart plexmediaserver || exit 1
++  fi
++  msg_ok "Configured Selected DVB Devices for Plex"
++fi
++
+ motd_ssh
+ customize
+ cleanup_lxc

@@ -1,0 +1,10 @@
+--- a/core/build.func
++++ b/core/build.func
+@@ -232,6 +232,7 @@
+ # so a new .func cannot be forgotten here. A file missing from it would still
+ # work — _cs_local_path falls through to the network — just slower.
+ _CS_ENGINE_FILES=(
++  lib/dvb-selection.func lib/dvb.func lib/dvb-banner.func
+   lib/alpine.func api/api.func
+   api/errorlog.func api/exitcodes.func api/sysinfo.func
+   api/telemetry.func

@@ -1,0 +1,44 @@
+--- a/incus/backend.func
++++ b/incus/backend.func
+@@ -323,6 +323,7 @@
+   export PCT_DISK_SIZE="${DISK_SIZE}"
+   export IPV6_METHOD="${IPV6_METHOD:-auto}"
+   export ENABLE_GPU="${ENABLE_GPU:-no}"
++  export ENABLE_DVB="${ENABLE_DVB:-${var_dvb:-no}}"
+   export APPLICATION_VERSION="${var_appversion:-}"
+ 
+   # The container writes its own MOTD, so it has to know whether this is a
+@@ -339,6 +340,10 @@
+ }
+ 
+ incus_create_lxc_container() {
++  if [[ "${ENABLE_DVB:-${var_dvb:-no}}" == yes && $EUID != 0 ]]; then
++    msg_error "DVB host device management requires root; rerun on the host as root or disable DVB"
++    return 1
++  fi
+   LOGFILE="${INCUS_BUILD_LOG}"
+ 
+   [[ "${CT_NAME:-}" ]] || { msg_error "Container name not set"; exit 203; }
+@@ -875,6 +880,14 @@
+   if [[ -e /dev/apex_0 ]]; then
+     msg_custom "🔌" "${BL}" "Detected Coral TPU - configuring passthrough"
+     _incus_soft incus config device add "${CT_NAME}" apex0 unix-char source=/dev/apex_0 path=/dev/apex_0 >>"${LOGFILE:-$INCUS_BUILD_LOG}" 2>&1
++  fi
++  if [[ "${ENABLE_DVB:-${var_dvb:-no}}" == yes ]]; then
++    if ! declare -F dvb_community_select >/dev/null; then
++      _cs_source_func "lib/dvb-selection.func" || return 1
++    fi
++    dvb_community_select || return 1
++    dvb_community_incus_config "$CT_NAME" || return 1
++    msg_ok "DVB passthrough: ${#dvb_selected_ids[@]} selected physical device(s)"
+   fi
+   return 0
+ }
+@@ -1433,6 +1446,7 @@
+     ENABLE_FUSE="${ENABLE_FUSE:-no}"
+     ENABLE_TUN="${ENABLE_TUN:-no}"
+     ENABLE_GPU="${ENABLE_GPU:-no}"
++    ENABLE_DVB="${ENABLE_DVB:-${var_dvb:-no}}"
+     IPV6_METHOD="${IPV6_METHOD:-auto}"
+     SSH_ROOT="${SSH:-no}"
+     CACHER="${APT_CACHER:-}"

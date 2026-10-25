@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG / Chris
+# License: MIT
+# Managed by dvb-passthrough.sh
+# Shared with the embedded banner helpers in dvb-passthrough.sh.
+
+dvb_banner_profile() {
+  cat <<'PROFILE'
+#!/bin/sh
+# Managed by dvb-passthrough.sh
+# Availability only: inspect registrations, never open a tuner at login.
+case $- in
+*i*)
+if [ -t 1 ]; then
+  (
+    sys=/sys
+    dev=/dev
+    manifest=/var/lib/dvb-passthrough/banner-devices.tsv
+    [ -r "$manifest" ] || exit 0
+    summary=''
+    tab=$(printf '\t')
+    while IFS="$tab" read -r identity label nodes extra; do
+      case "$identity" in usb:*|path:*) ;; *) continue ;; esac
+      [ -n "$label" ] && [ -n "$nodes" ] && [ -z "$extra" ] || continue
+      label=$(printf '%s' "$label" | LC_ALL=C tr -cd '[:print:]')
+      total=0; available=0; seen=''
+      previous_ifs=$IFS
+      IFS=,
+      for node in $nodes; do
+        case "$node" in /dev/dvb/adapter*/frontend*) ;; *) continue ;; esac
+        rest=${node#/dev/dvb/adapter}; adapter=${rest%%/*}; frontend=${rest#*/frontend}
+        case "$adapter:$frontend" in *[!0-9:]*|:*|*:) continue ;; esac
+        total=$((total+1))
+        node="$dev/${node#/dev/}"
+        [ -c "$node" ] || continue
+        number=$(stat -Lc '%t:%T' "$node" 2>/dev/null) || continue
+        number=$(printf '%d:%d' "0x${number%:*}" "0x${number#*:}") || continue
+        case " $seen " in *" $number "*) continue ;; esac
+        seen="$seen $number"
+        registration=$(readlink -f "$sys/dev/char/$number") || continue
+        printf '%s\n' "${registration##*/}" | grep -Eq '^dvb[0-9]+\.frontend[0-9]+$' || continue
+        physical=$(readlink -f "$registration/device") || continue
+        [ -d "$physical" ] || continue
+        while [ "$physical" != "$sys" ] && [ "$physical" != / ] && [ -n "$physical" ]; do
+          if [ -f "$physical/idVendor" ] && [ -f "$physical/idProduct" ]; then break; fi
+          if [ -L "$physical/subsystem" ] && [ "$(readlink -f "$physical/subsystem")" = "$sys/bus/pci" ]; then break; fi
+          physical=${physical%/*}
+        done
+        case "$identity" in
+          usb:*)
+            [ -r "$physical/serial" ] && [ -r "$physical/idVendor" ] && [ -r "$physical/idProduct" ] || continue
+            actual="usb:$(cat "$physical/idVendor"):$(cat "$physical/idProduct"):$(cat "$physical/serial")"
+            ;;
+          path:*) actual="path:${physical#"$sys"/devices/}" ;;
+        esac
+        [ "$actual" = "$identity" ] || continue
+        available=$((available+1))
+      done
+      IFS=$previous_ifs
+      [ "$total" -gt 0 ] || continue
+      plural=''; [ "$total" -eq 1 ] || plural=s
+      if [ "$available" -eq "$total" ]; then
+        detail="$total tuner$plural"
+      elif [ "$available" -eq 0 ]; then
+        detail="missing; $total configured tuner$plural"
+      else
+        detail="$available/$total tuners available"
+      fi
+      summary="$summary${summary:+, }$label ($detail)"
+    done < "$manifest"
+    [ -z "$summary" ] || printf '  📺  \033[m\033[33mDVB Devices: \033[1;92m%s\033[m\n' "$summary"
+  ) 2>/dev/null || :
+fi
+;;
+esac
+PROFILE
+}
+
+dvb_banner_validate() {
+  local file=$1 identity label nodes extra node
+  local -a parts=()
+  local -A identities=() paths=()
+  grep -qxF '# Managed by dvb-passthrough.sh' "$file" || return 1
+  while IFS=$'\t' read -r identity label nodes extra; do
+    [[ $identity != '# Managed by dvb-passthrough.sh' ]] || continue
+    [[ $identity =~ ^(usb:|path:)[a-zA-Z0-9_.:/-]+$ && -n $label && ! $label =~ [[:cntrl:]] &&
+      $nodes =~ ^/dev/dvb/adapter[0-9]+/frontend[0-9]+(,/dev/dvb/adapter[0-9]+/frontend[0-9]+)*$ && -z $extra ]] || return 1
+    [[ -z ${identities[$identity]+x} ]] || return 1
+    identities[$identity]=1
+    IFS=, read -r -a parts <<<"$nodes"
+    for node in "${parts[@]}"; do
+      [[ -z ${paths[$node]+x} ]] || return 1
+      paths[$node]=1
+    done
+  done <"$file"
+}
+
+# Initial community installation derives its roster only from assigned nodes.
+# Skip kernel-name directory aliases and deduplicate character device numbers.
+dvb_banner_capture() {
+  local sys=${SYS_ROOT:-/sys} dev=${DEV_ROOT:-/dev} node number registration physical label key
+  local -a roots=()
+  local -A seen=() labels=() nodes=()
+  for node in "$dev"/dvb/adapter*/frontend*; do
+    [[ -c $node && ! -L ${node%/*} && $node =~ /adapter[0-9]+/frontend[0-9]+$ ]] || continue
+    number=$(stat -Lc '%t:%T' "$node") || return
+    [[ -z ${seen[$number]+x} ]] || continue
+    seen[$number]=1
+    printf -v number '%d:%d' "0x${number%:*}" "0x${number#*:}"
+    registration=$(readlink -f "$sys/dev/char/$number") || continue
+    [[ ${registration##*/} =~ ^dvb[0-9]+\.frontend[0-9]+$ ]] || continue
+    physical=$(readlink -f "$registration/device") || continue
+    [[ -d $physical ]] || continue
+    while [[ $physical != "$sys" && $physical != / ]]; do
+      [[ ! -f $physical/idVendor || ! -f $physical/idProduct ]] || break
+      if [[ -L $physical/subsystem && $(readlink -f "$physical/subsystem") == "$sys/bus/pci" ]]; then break; fi
+      physical=${physical%/*}
+    done
+    [[ $physical != "$sys" && $physical != / ]] || continue
+    if [[ -z ${nodes[$physical]+x} ]]; then
+      roots+=("$physical")
+      label="PCI ${physical##*/}"
+      if [[ -f $physical/product ]]; then
+        label=$(cat "$physical/product")
+      elif [[ -f $physical/idVendor && -f $physical/idProduct ]]; then label="USB $(cat "$physical/idVendor"):$(cat "$physical/idProduct")"; fi
+      label=$(printf '%s' "$label" | LC_ALL=C tr -cd '[:print:]')
+      labels[$physical]=${label:-DVB device}
+      nodes[$physical]=''
+    fi
+    nodes[$physical]+="${nodes[$physical]:+,}/dev/${node#"$dev"/}"
+  done
+  printf '%s\n' '# Managed by dvb-passthrough.sh'
+  for key in "${roots[@]}"; do
+    printf 'path:%s\t%s\t%s\n' "${key#"$sys"/devices/}" "${labels[$key]}" "${nodes[$key]}"
+  done
+}
+
+# shellcheck disable=SC2120 # The standalone transport passes --manifest-stdin.
+dvb_banner_install() {
+  local state=${dvb_banner_state:-/var/lib/dvb-passthrough}
+  local profile=${dvb_banner_profile:-/etc/profile.d/10-dvb-details.sh}
+  local backup_root=${dvb_banner_backup_root:-/var/backups/dvb-passthrough}
+  local file manifest temporary roster backup
+  manifest="$state/banner-devices.tsv"
+  for file in "$profile" "$manifest"; do
+    [[ ! -e $file && ! -L $file ]] || {
+      [[ -f $file && ! -L $file ]] && grep -qxF '# Managed by dvb-passthrough.sh' "$file" || {
+        printf 'Unrecognized DVB banner file: %s\n' "$file" >&2
+        return 1
+      }
+    }
+  done
+  mkdir -p "$state" "${profile%/*}" "$backup_root" || return
+  chmod 0755 "$state" || return
+  chmod 0700 "$backup_root" || return
+  roster=$(mktemp "$state/.banner-roster.XXXXXXXX") || return
+  if [[ ${1:-} == --manifest-stdin ]]; then
+    cat >"$roster" || return
+  elif [[ -f $manifest ]]; then
+    cp -- "$manifest" "$roster" || return
+  else
+    dvb_banner_capture >"$roster" || return
+  fi
+  if ! dvb_banner_validate "$roster"; then
+    rm -- "$roster"
+    printf 'Invalid DVB banner roster\n' >&2
+    return 1
+  fi
+  backup=$(mktemp -d "$backup_root/banner.XXXXXXXX") || return
+  chmod 0700 "$backup" || return
+  for file in "$profile" "$manifest"; do
+    [[ ! -f $file ]] || cp -- "$file" "$backup/" || return
+  done
+  temporary=$(mktemp "${profile}.XXXXXXXX") || return
+  dvb_banner_profile >"$temporary" || return
+  chmod 0755 "$temporary" || return
+  chmod 0644 "$roster" || return
+  mv -Tf -- "$roster" "$manifest" || return
+  mv -Tf -- "$temporary" "$profile" || return
+  printf 'DVB banner installed. Backup: %s\n' "$backup"
+}
+
+dvb_banner_library() {
+  printf '%s\n' '#!/usr/bin/env bash' '# Managed by dvb-passthrough.sh'
+  declare -f dvb_banner_profile dvb_banner_validate dvb_banner_capture dvb_banner_install
+}

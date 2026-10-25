@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.venv/
+venv/
+dist/
+build/
+
+# Disposable upstream trees used by the patch tooling.
+upstream-downloads/
+patched/

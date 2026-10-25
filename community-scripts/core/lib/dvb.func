@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG / Chris
+# License: MIT
+# Container permissions only. Physical selection belongs to the host backend.
+# Managed by dvb-passthrough.sh
+[[ -n "${_TOOLS_DVB_LOADED:-}" ]] && return 0
+_TOOLS_DVB_LOADED=1
+
+setup_dvb() {
+  local service_user=${1:-} node gid group
+  local -A seen=()
+  export dvb_groups_changed=0
+  [[ -d /dev/dvb ]] || return 0
+  [[ -n $service_user ]] && id "$service_user" >/dev/null 2>&1 || return 1
+  for node in /dev/dvb/adapter*/* /dev/media*; do
+    [[ -c $node ]] || continue
+    if runuser -u "$service_user" -- test -r "$node" && runuser -u "$service_user" -- test -w "$node"; then
+      continue
+    fi
+    gid=$(stat -Lc '%g' "$node") || return
+    [[ $gid != 0 ]] || {
+      printf 'Refusing to grant root-group membership for %s\n' "$node" >&2
+      return 1
+    }
+    if [[ -z ${seen[$gid]+x} ]]; then
+      seen[$gid]=1
+      group=$(getent group "$gid") || group=''
+      group=${group%%:*}
+      if [[ -z $group ]]; then
+        group="dvb_$gid"
+        groupadd -g "$gid" "$group" || return
+      fi
+      if [[ " $(id -G "$service_user") " != *" $gid "* ]]; then
+        usermod -aG "$group" "$service_user" || return
+        dvb_groups_changed=1
+      fi
+    fi
+    runuser -u "$service_user" -- test -r "$node" || return
+    runuser -u "$service_user" -- test -w "$node" || return
+  done
+}
+
+# Prefer the actual daemon identity, including accounts configured through a
+# systemd override. Parse defaults as data only when the daemon is not running.
+dvb_tvheadend_user() {
+  local user=${dvb_service_user:-} pid uid record options configured
+  if [[ -z $user ]]; then
+    pid=$(systemctl show tvheadend.service -p MainPID --value) || return
+    if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
+      uid=$(awk '/^Uid:/ {print $3}' "${dvb_proc_root:-/proc}/$pid/status") || return
+      [[ $uid != 0 ]] || {
+        printf 'TVHeadend is running as root; configure its service account first\n' >&2
+        return 1
+      }
+      record=$(getent passwd "$uid") || return
+      user=${record%%:*}
+    else
+      user=$(systemctl show tvheadend.service -p User --value) || return
+      if [[ -z $user || $user == root ]]; then
+        user=hts
+        if [[ -r ${dvb_tvh_defaults:-/etc/default/tvheadend} ]]; then
+          options=$(awk '/^OPTIONS=/ {line=$0} END {print line}' "${dvb_tvh_defaults:-/etc/default/tvheadend}") || return
+          options=${options//\"/ }
+          options=${options//\'/ }
+          configured='(^|[[:space:]])-u[[:space:]]+([a-zA-Z_][a-zA-Z0-9_-]*\$?)([[:space:]]|$)'
+          if [[ $options =~ $configured ]]; then user=${BASH_REMATCH[2]}; fi
+        fi
+      fi
+    fi
+  fi
+  [[ $user =~ ^[a-zA-Z_][a-zA-Z0-9_-]*\$?$ ]] && id "$user" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$user"
+}
+
+dvb_verify_service() {
+  local user=$1 service=$2 pid uid expected_uid groups gid node
+  pid=$(systemctl show "$service" -p MainPID --value) || return
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || {
+    printf '%s is not running; device verification incomplete\n' "$service" >&2
+    return 1
+  }
+  uid=$(awk '/^Uid:/ {print $3}' "${dvb_proc_root:-/proc}/$pid/status") || return
+  expected_uid=$(id -u "$user") || return
+  [[ $uid == "$expected_uid" ]] || {
+    printf '%s is running as UID %s, expected %s\n' "$service" "$uid" "$expected_uid" >&2
+    return 1
+  }
+  groups=$(awk '/^Gid:/ {print $3} /^Groups:/ {for (i=2;i<=NF;i++) print $i}' "${dvb_proc_root:-/proc}/$pid/status") || return
+  for node in /dev/dvb/adapter*/* /dev/media*; do
+    [[ -c $node ]] || continue
+    runuser -u "$user" -- test -r "$node" && runuser -u "$user" -- test -w "$node" || return 1
+    gid=$(stat -Lc '%g' "$node") || return
+    if ! grep -qxF "$gid" <<<"$groups"; then
+      printf '%s has not acquired device GID %s for %s; restart the service\n' "$service" "$gid" "$node" >&2
+      return 1
+    fi
+  done
+  if [[ $service == tvheadend.service ]]; then
+    local number
+    local -A seen_frontends=()
+    for node in /dev/dvb/adapter*/frontend*; do
+      [[ -c $node ]] || continue
+      number=$(stat -Lc '%t:%T' "$node") || return
+      if [[ -n ${seen_frontends[$number]+x} ]]; then
+        printf 'Duplicate TVHeadend discovery paths: %s and %s; restart the container after stable setup or review unmanaged aliases\n' "${seen_frontends[$number]}" "$node" >&2
+        return 1
+      fi
+      seen_frontends[$number]=$node
+    done
+  fi
+}
+
+dvb_verify_roster() {
+  local manifest=${dvb_banner_state:-/var/lib/dvb-passthrough}/banner-devices.tsv id _label paths node
+  local -a nodes=()
+  [[ -f $manifest ]] || return 0
+  grep -qxF '# Managed by dvb-passthrough.sh' "$manifest" || return 1
+  while IFS=$'\t' read -r id _label paths; do
+    [[ $id != \#* && -n $id ]] || continue
+    IFS=',' read -r -a nodes <<<"$paths"
+    for node in "${nodes[@]}"; do
+      [[ $node == /dev/dvb/adapter*/frontend* ]] || return 1
+      [[ -c $node ]] || {
+        printf 'Configured DVB frontend missing: %s\n' "$node" >&2
+        return 1
+      }
+    done
+  done <"$manifest"
+}
+
+dvb_permissions_library() {
+  printf '%s\n' '#!/usr/bin/env bash' '# Managed by dvb-passthrough.sh'
+  declare -f setup_dvb dvb_tvheadend_user dvb_verify_service dvb_verify_roster
+}
+
+dvb_require_nodes() {
+  local node
+  [[ ${ENABLE_DVB:-${var_dvb:-no}} == yes ]] || return 0
+  for node in /dev/dvb/adapter*/*; do [[ ! -c $node ]] || return 0; done
+  printf 'DVB passthrough was enabled, but no assigned character devices are visible\n' >&2
+  return 1
+}
+
+dvb_store_library() {
+  local destination=$1 content=$2 backup temporary
+  if [[ -e $destination || -L $destination ]]; then
+    [[ -f $destination && ! -L $destination ]] &&
+      grep -qxF -e '# Managed by dvb-passthrough.sh' -e '# Container permissions only. Physical selection belongs to the host backend.' "$destination" || {
+      printf 'Unrecognized DVB helper: %s\n' "$destination" >&2
+      return 1
+    }
+    backup=$(mktemp -d "${dvb_helper_backup_root:-/var/backups/dvb-passthrough}/helpers.XXXXXXXX") || return
+    cp -p -- "$destination" "$backup/" || return
+  fi
+  temporary=$(mktemp "${destination}.XXXXXXXX") || return
+  printf '%s\n' "$content" >"$temporary"
+  chmod 0644 "$temporary" && mv -f -- "$temporary" "$destination" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+}
+
+dvb_install_helpers() {
+  local permissions_source=${1:-} banner_source directory=${dvb_helper_dir:-/usr/local/lib/community-scripts}
+  [[ -n $permissions_source ]] || permissions_source=$(dvb_permissions_library) || return
+  banner_source=$(dvb_banner_library) || return
+  mkdir -p "$directory" "${dvb_helper_backup_root:-/var/backups/dvb-passthrough}" || return
+  dvb_store_library "$directory/dvb.func" "$permissions_source" || return
+  dvb_store_library "$directory/dvb-banner.func" "$banner_source" || return
+  dvb_banner_install
+}
+
+dvb_prepare_container() {
+  local user=$1 source=${2:-}
+  setup_dvb "$user" || return
+  dvb_install_helpers "$source"
+}

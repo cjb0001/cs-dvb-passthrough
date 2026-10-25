@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+
+      - name: Check Bash syntax
+        run: |
+          bash -n dvb-passthrough.sh
+          bash -n community-scripts/ProxmoxVE/ct/plex.sh
+          bash -n community-scripts/ProxmoxVE/ct/tvheadend.sh
+          bash -n community-scripts/ProxmoxVE/install/tvheadend-install.sh
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck -S error -s bash \
+            dvb-passthrough.sh \
+            community-scripts/core/lib/*.func \
+            community-scripts/ProxmoxVE/ct/*.sh \
+            community-scripts/ProxmoxVE/install/*.sh
+
+      - name: Run regression tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+          sudo env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v

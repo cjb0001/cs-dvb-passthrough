@@ -1,0 +1,9 @@
+--- a/lib/tools.func
++++ b/lib/tools.func
+@@ -83,3 +83,6 @@
+ _tools_source_part runtime
+ _tools_source_part db
+ _tools_source_part hwaccel
++
++_tools_source_part dvb-banner
++_tools_source_part dvb

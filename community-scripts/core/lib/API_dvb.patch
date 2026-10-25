@@ -1,0 +1,30 @@
+--- a/lib/API.txt
++++ b/lib/API.txt
+@@ -75,6 +75,19 @@
+ download_file
+ download_gpg_key
+ download_with_progress
++dvb_banner_capture
++dvb_banner_install
++dvb_banner_library
++dvb_banner_profile
++dvb_banner_validate
++dvb_install_helpers
++dvb_permissions_library
++dvb_prepare_container
++dvb_require_nodes
++dvb_store_library
++dvb_tvheadend_user
++dvb_verify_roster
++dvb_verify_service
+ edit_yaml_config
+ enable_and_start_service
+ end_timer
+@@ -133,6 +146,7 @@
+ setup_deb822_repo
+ setup_docker
+ setup_dotnet
++setup_dvb
+ setup_ffmpeg
+ setup_go
+ setup_gs

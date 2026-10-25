@@ -1,0 +1,40 @@
+--- a/pve/backend.func
++++ b/pve/backend.func
+@@ -497,6 +497,7 @@
+   export var_ram="$RAM_SIZE"
+   export IPV6_METHOD="$IPV6_METHOD"
+   export ENABLE_GPU="$ENABLE_GPU"
++  export ENABLE_DVB="${ENABLE_DVB:-${var_dvb:-no}}"
+   export APPLICATION_VERSION="${var_appversion:-}"
+ 
+   # The container writes its own MOTD, so it has to know whether this is a
+@@ -718,6 +719,21 @@
+     msg_debug "NVIDIA devices: ${NVIDIA_DEVICES[*]}"
+   }
+ 
++  # Configure only selected DVB devices, with cross-container ownership checks.
++  configure_dvb_passthrough() {
++    [[ "${ENABLE_DVB:-${var_dvb:-no}}" == yes ]] || return 0
++    if ! declare -F dvb_community_select >/dev/null; then
++      _cs_source_func "lib/dvb-selection.func" || return 1
++    fi
++    local help
++    help=$(pct help set --verbose 2>&1) || return 1
++    [[ $help == *'--dev'* ]] || { msg_error 'Native devN passthrough is required'; return 1; }
++    dvb_community_select || return 1
++    dvb_community_pve_config "$LXC_CONFIG" || return 1
++    export dvb_configured=1
++    msg_ok "DVB passthrough: ${#dvb_selected_ids[@]} selected physical device(s)"
++  }
++
+   # Configure USB passthrough for privileged containers
+   configure_usb_passthrough() {
+     if [[ "$CT_TYPE" != "0" ]]; then
+@@ -930,6 +946,7 @@
+   # Execute pre-start configurations
+   configure_usb_passthrough
+   configure_gpu_passthrough
++  configure_dvb_passthrough || return 1
+   configure_additional_devices
+ 
+   # GPU_TYPE can now name several types at once, so this asks whether AMD is

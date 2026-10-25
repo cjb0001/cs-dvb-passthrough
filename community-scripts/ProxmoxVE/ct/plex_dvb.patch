@@ -1,0 +1,50 @@
+--- a/ct/plex.sh
++++ b/ct/plex.sh
+@@ -16,11 +16,35 @@
+ var_arm64="${var_arm64:-yes}"
+ var_unprivileged="${var_unprivileged:-1}"
+ var_gpu="${var_gpu:-yes}"
++var_dvb="${var_dvb:-no}"
++var_dvb_tuners="${var_dvb_tuners:-}"
++var_dvb_gid="${var_dvb_gid:-44}"
+ 
+ header_info "$APP"
+ variables
+ color
+ catch_errors
++
++function verify_plex_dvb_access() {
++  local node
++  # Updates run inside the CT. Preserve its host selection and existing helper;
++  # only verify the nodes already passed through to this container.
++  if [[ -x /usr/local/sbin/dvb-passthrough-aliases ]]; then
++    /usr/local/sbin/dvb-passthrough-aliases || return 1
++  fi
++  if [[ -r /usr/local/lib/community-scripts/dvb-banner.func ]]; then
++    source /usr/local/lib/community-scripts/dvb-banner.func || return 1
++    dvb_banner_install || return 1
++  fi
++  if [[ -r /usr/local/lib/community-scripts/dvb.func ]]; then
++    source /usr/local/lib/community-scripts/dvb.func || return 1
++    setup_dvb plex || return 1
++  fi
++  for node in /dev/dvb/adapter*/*; do
++    [[ -c $node ]] || continue
++    runuser -u plex -- test -r "$node" && runuser -u plex -- test -w "$node" || return 1
++  done
++}
+ 
+ function update_script() {
+   header_info
+@@ -78,8 +102,9 @@
+   fi
+ 
+   msg_info "Updating Plex Media Server"
+-  apt_update_safe
+-  $STD apt install -y plexmediaserver
++  apt_update_safe || return 1
++  $STD apt install -y plexmediaserver || return 1
++  verify_plex_dvb_access || { msg_error "Plex DVB preparation failed"; return 1; }
+   msg_ok "Updated Plex Media Server"
+ 
+   msg_info "Restarting Plex Media Server"
